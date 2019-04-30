@@ -1,8 +1,10 @@
 package standup
 
 import (
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
+	_ "github.com/GoogleCloudPlatform/berglas/pkg/auto"
 	"github.com/alexandre-normand/slackscot/store"
 	"github.com/alexandre-normand/slackscot/store/datastoredb"
 	"github.com/lithammer/shortuuid"
@@ -84,7 +86,14 @@ func RecordStandup(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	err = persistStatus(store, callback.User.ID, strings.Split(callback.Submission["yesterday"], "\n"), strings.Split(callback.Submission["today"], "\n"), strings.Split(callback.Submission["blockers"], "\n"))
+	status, serialized, err := makeStatus(callback.User.ID, strings.Split(callback.Submission["yesterday"], "\n"), strings.Split(callback.Submission["today"], "\n"), strings.Split(callback.Submission["blockers"], "\n"))
+	if err != nil {
+		log.Printf("Error creating/serializing status %v", err)
+		http.Error(w, err.Error(), 500)
+		return
+	}
+
+	err = persistStatus(store, callback.User.ID, serialized)
 	if err != nil {
 		log.Printf("Error creating persistence: %v", err)
 		http.Error(w, err.Error(), 500)
@@ -97,7 +106,7 @@ func RecordStandup(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	_, _, err = sc.PostMessage(callback.Channel.ID, slack.MsgOptionText(fmt.Sprintf("Here's today standup status from <@%s>:\n", callback.User.ID), false))
+	_, _, err = sc.PostMessage(callback.Channel.ID, slack.MsgOptionText(reportStatus(status), false))
 	if err != nil {
 		http.Error(w, err.Error(), 500)
 		return
@@ -125,15 +134,45 @@ func Report(w http.ResponseWriter, r *http.Request) {
 
 }
 
-func persistStatus(storer store.GlobalSiloStringStorer, userID string, yesterday []string, today []string, blockers []string) (err error) {
-	_, serialized, err := makeStatus(userID, yesterday, today, blockers)
-	if err != nil {
-		return err
-	}
-
-	err = storer.PutSiloString(groupID, userID, serialized)
+func persistStatus(storer store.GlobalSiloStringStorer, userID string, serialized string) (err error) {
+	encoded := base64.StdEncoding.EncodeToString([]byte(serialized))
+	err = storer.PutSiloString(groupID, userID, encoded)
 
 	return err
+}
+
+func reportStatus(status Status) (msg string) {
+	var strBuilder strings.Builder
+	userID, _ := status.UserID()
+
+	fmt.Fprintf(&strBuilder, "Here's today standup status from <@%s>:\n", userID)
+	if status.HasYesterday() {
+		fmt.Fprintf(&strBuilder, "\n*What <@%s> did yesterday:*\n", userID)
+		tl, _ := status.Yesterday()
+		for i := 0; i < tl.Len(); i++ {
+			yesterday, _ := tl.At(i)
+			fmt.Fprintf(&strBuilder, "  • %s\n", yesterday)
+		}
+	}
+
+	if status.HasToday() {
+		fmt.Fprintf(&strBuilder, "\n*What <@%s> is doing today:*\n", userID)
+		tl, _ := status.Today()
+		for i := 0; i < tl.Len(); i++ {
+			today, _ := tl.At(i)
+			fmt.Fprintf(&strBuilder, "  • %s\n", today)
+		}
+	}
+
+	if status.HasBlockers() {
+		fmt.Fprintf(&strBuilder, "\n*Blockers?*\n")
+		tl, _ := status.Blockers()
+		for i := 0; i < tl.Len(); i++ {
+			blocker, _ := tl.At(i)
+			fmt.Fprintf(&strBuilder, "  • %s\n", blocker)
+		}
+	}
+	return strBuilder.String()
 }
 
 func makeStatus(userID string, yesterday []string, today []string, blockers []string) (status Status, serialized string, err error) {
@@ -156,6 +195,28 @@ func makeStatus(userID string, yesterday []string, today []string, blockers []st
 
 		for i, v := range yesterday {
 			yesterdayEntries.Set(i, v)
+		}
+	}
+
+	if len(today) > 0 {
+		todayEntries, err := status.NewToday(int32(len(today)))
+		if err != nil {
+			return status, "", err
+		}
+
+		for i, v := range today {
+			todayEntries.Set(i, v)
+		}
+	}
+
+	if len(blockers) > 0 {
+		blockerEntries, err := status.NewBlockers(int32(len(blockers)))
+		if err != nil {
+			return status, "", err
+		}
+
+		for i, v := range blockers {
+			blockerEntries.Set(i, v)
 		}
 	}
 
